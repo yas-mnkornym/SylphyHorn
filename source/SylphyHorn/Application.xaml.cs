@@ -1,69 +1,82 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Windows;
-using System.Windows.Interop;
-using WindowsDesktop;
+using System.Windows.Threading;
 using Livet;
-using MetroRadiance;
+using MetroRadiance.UI;
 using MetroTrilithon.Lifetime;
+using MetroTrilithon.Linq;
 using StatefulModel;
-using SylphyHorn.Models;
-using SylphyHorn.ViewModels;
-using SylphyHorn.Views;
-using MessageBox = System.Windows.MessageBox;
+using SylphyHorn.Serialization;
+using SylphyHorn.Services;
 
 namespace SylphyHorn
 {
 	sealed partial class Application : IDisposableHolder
 	{
-		private readonly CompositeDisposable compositeDisposable = new CompositeDisposable();
-		private System.Windows.Forms.NotifyIcon notifyIcon;
-		private TransparentWindow transparentWindow;
-		private HookService hookService;
-		private NotificationService notificationService;
+		public static bool IsWindowsBridge { get; }
+#if APPX
+			= true;
+#else
+			= false;
+#endif
+
+		public static CommandLineArgs Args { get; private set; }
 
 		static Application()
 		{
-			AppDomain.CurrentDomain.UnhandledException += (sender, args) => ReportException(sender, args.ExceptionObject as Exception);
+			AppDomain.CurrentDomain.UnhandledException += HandleUnhandledException;
 		}
+
+		private readonly MultipleDisposable _compositeDisposable = new MultipleDisposable();
+
+		internal HookService HookService { get; private set; }
 
 		protected override void OnStartup(StartupEventArgs e)
 		{
+			Args = new CommandLineArgs(e.Args);
+
+			if (Args.Setup)
+			{
+				SetupShortcut();
+			}
+
 #if !DEBUG
 			var appInstance = new MetroTrilithon.Desktop.ApplicationInstance().AddTo(this);
-			if (appInstance.IsFirst)
+			if (appInstance.IsFirst || Args.Restarted.HasValue)
 #endif
 			{
-				if (VirtualDesktop.IsSupported)
+				if (WindowsDesktop.VirtualDesktop.IsSupported)
 				{
 					this.ShutdownMode = ShutdownMode.OnExplicitShutdown;
-					this.DispatcherUnhandledException += (sender, args) =>
-					{
-						ReportException(sender, args.Exception);
-						args.Handled = true;
-					};
+					this.DispatcherUnhandledException += this.HandleDispatcherUnhandledException;
 
 					DispatcherHelper.UIDispatcher = this.Dispatcher;
 
-					ThemeService.Current.Initialize(
-						this,
-						GeneralSettings.Theme.Value ?? (VisualHelper.IsDarkTheme() ? Theme.Dark : Theme.Light), 
-						GeneralSettings.AccentColor.Value ?? Accent.Blue);
+					LocalSettingsProvider.Instance.LoadAsync().Wait();
 
-					this.transparentWindow = new TransparentWindow();
-					this.transparentWindow.Show();
+					Settings.General.Culture.Subscribe(x => ResourceService.Current.ChangeCulture(x)).AddTo(this);
+					ThemeService.Current.Register(this, Theme.Windows, Accent.Windows);
+					UI.Themes.ThemeService2.Current.Register(this);
 
-					if (GeneralSettings.AccentColor.Value == null)
+					this.HookService = new HookService().AddTo(this);
+
+					var preparation = new ApplicationPreparation(this);
+					preparation.ShowTaskTrayIcon();
+					preparation.RegisterActions();
+
+					NotificationService.Instance.AddTo(this);
+					WallpaperService.Instance.AddTo(this);
+
+#if !DEBUG
+					appInstance.CommandLineArgsReceived += (sender, message) =>
 					{
-						VisualHelper.ForceChangeAccent(VisualHelper.GetWindowsAccentColor());
-					}
-
-					this.ShowNotifyIcon();
-					this.hookService = new HookService().AddTo(this);
-					this.notificationService = new NotificationService().AddTo(this);
+						var args = new CommandLineArgs(message.CommandLineArgs);
+						if (args.Setup) SetupShortcut();
+					};
+#endif
 
 					base.OnStartup(e);
 				}
@@ -85,88 +98,60 @@ namespace SylphyHorn
 		protected override void OnExit(ExitEventArgs e)
 		{
 			base.OnExit(e);
-		
 			((IDisposable)this).Dispose();
 		}
 
-		private static void ReportException(object sender, Exception exception)
+		private static void SetupShortcut()
 		{
-			#region const
-
-			const string messageFormat = @"
-===========================================================
-ERROR, date = {0}, sender = {1},
-{2}
-";
-			const string path = "error.log";
-
-			#endregion
-
-			// ToDo: 例外ダイアログ
-
-			try
+			var startup = new Startup();
+			if (!startup.IsExists)
 			{
-				var message = string.Format(messageFormat, DateTimeOffset.Now, sender, exception);
-
-				Debug.WriteLine(message);
-				File.AppendAllText(path, message);
-				MessageBox.Show(message, "Unexpected error occurred");
-			}
-			catch (Exception ex)
-			{
-				Debug.WriteLine(ex);
-			}
-
-			// とりあえずもう終了させるしかないもじゃ
-			// 救えるパターンがあるなら救いたいけど方法わからんもじゃ
-			Current.Shutdown();
-		}
-		
-
-		private void ShowNotifyIcon()
-		{
-			const string iconUri = "pack://application:,,,/SylphyHorn;Component/Assets/tasktray.ico";
-
-			Uri uri;
-			if (!Uri.TryCreate(iconUri, UriKind.Absolute, out uri)) return;
-
-			var streamResourceInfo = GetResourceStream(uri);
-			if (streamResourceInfo == null) return;
-
-			using (var stream = streamResourceInfo.Stream)
-			{
-				this.notifyIcon = new System.Windows.Forms.NotifyIcon
-				{
-					Text = ProductInfo.Title,
-					Icon = new System.Drawing.Icon(stream, new System.Drawing.Size(16, 16)),
-					Visible = true,
-					ContextMenu = new System.Windows.Forms.ContextMenu(new[]
-					{
-						new System.Windows.Forms.MenuItem("&Settings (S)", (sender, args) => this.ShowSettings()),
-						new System.Windows.Forms.MenuItem("E&xit (X)", (sender, args) => this.Shutdown()),
-					}),
-				};
-				this.notifyIcon.AddTo(this);
+				startup.Create();
 			}
 		}
 
-		private void ShowSettings()
+		private void HandleDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs args)
 		{
-			using (this.hookService.Suspend())
+			LoggingService.Instance.Register(args.Exception);
+			args.Handled = true;
+		}
+
+		private static void HandleUnhandledException(object sender, UnhandledExceptionEventArgs args)
+		{
+			if ((DateTime.Now - Process.GetCurrentProcess().StartTime).TotalMinutes >= 3)
 			{
-				var window = new SettingsWindow { DataContext = new SettingsWindowViewModel(), };
-				window.ShowDialog();
+				// 3 分以上生きてたら安定稼働と見做して再起動させる
+				Restart();
+			}
+			else
+			{
+				// ToDo: Exception dialog
 			}
 		}
 
+		private static void Restart()
+		{
+			if (Args != null)
+			{
+				var restartCount = Args.Restarted ?? 0;
+
+				Process.Start(
+					Environment.GetCommandLineArgs()[0],
+					Args.Options
+						.Where(x => x.Key != Args.GetKey(nameof(CommandLineArgs.Restarted)))
+						.Concat(EnumerableEx.Return(Args.CreateOption(nameof(CommandLineArgs.Restarted), (restartCount + 1).ToString())))
+						.Select(x => x.ToString())
+						.JoinString(" "));
+			}
+		}
 
 		#region IDisposable members
 
-		ICollection<IDisposable> IDisposableHolder.CompositeDisposable => this.compositeDisposable;
+		ICollection<IDisposable> IDisposableHolder.CompositeDisposable => this._compositeDisposable;
 
 		void IDisposable.Dispose()
 		{
-			this.compositeDisposable.Dispose();
+			this._compositeDisposable.Dispose();
 		}
 
 		#endregion
