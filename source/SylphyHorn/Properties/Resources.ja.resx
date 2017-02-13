@@ -270,6 +270,12 @@
   <data name="Settings_Startup_Automaticaly" xml:space="preserve">
     <value>ログオン時に自動的に起動する</value>
   </data>
+  <data name="Settings_Switch_Left" xml:space="preserve">
+    <value>左へ切り替え:</value>
+  </data>
+  <data name="Settings_Switch_Right" xml:space="preserve">
+    <value>右へ切り替え:</value>
+  </data>
   <data name="Settings_Title" xml:space="preserve">
     <value>設定</value>
   </data>
